@@ -1,5 +1,4 @@
-crontub - a dynamic cron daemon
-======
+h1. crontub - a dynamic cron daemon
 
 crontub is a virtual crontab... it abstracts the definition of the
 crontab.  Currently the abstraction takes the form of scanning files
