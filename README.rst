@@ -1,4 +1,5 @@
-# crontub - a dynamic cron daemon
+crontub - a dynamic cron daemon
+======
 
 crontub is a virtual crontab... it abstracts the definition of the
 crontab.  Currently the abstraction takes the form of scanning files
@@ -16,7 +17,7 @@ the role checker).
 
 The config file:
 
-`  [cron]
+pre. [cron]
   pidfile = path
   roletest = somecommand`
 
@@ -28,14 +29,14 @@ cron should be run here or not.
 
 the roletest command is executed with the %% template variables:
 
-> 'role' set to the role being tested
-> 'user' set to the user being tested
+bq. 'role' set to the role being tested
+'user' set to the user being tested
 
 for example, setting 'roletest' thusly:
 
-  `roletest = /usr/local/bin/check_is_staging -u %(user)s %(role)s`
+pre. roletest = /usr/local/bin/check_is_staging -u %(user)s %(role)s
 
 with a role of "staging" and a user of "woome" would cause the
 following command to be executed:
 
-  `/usr/local/bin/check_is_staging -u woome staging`
+pre.  /usr/local/bin/check_is_staging -u woome staging
