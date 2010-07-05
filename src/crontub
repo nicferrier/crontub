@@ -1,0 +1,423 @@
+#!/usr/bin/python
+
+
+# crontub - the cron daemon
+# 
+# Copyright (C) 2010 by WooMedia
+# Nic Ferrier - nferrier@woome.com
+#
+# Copyright (C) 2003 Advanced Interface Technologies, Inc.
+# Emilio Schapira
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 2 of the License, or (at your
+# option) any later version.
+# 
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
+# for more details.
+# 
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+
+"""
+crontub - the tub for cron.
+
+usage: crontub [start|stop|run|dryrun]
+
+'start' starts a crontun daemon writing a pidfile specified by config 
+'stop' stops any daemon via the pidfile
+'run' runs once executing all commands that would have been scheduled
+'dryrun' runs once displaying what would have been executed
+
+crontub is a virtual crontab... it abstracts the definition of the
+crontab.  Currently the abstraction takes the form of scanning files
+for special CRONTAB declarations which are then assembled into a
+crontab as if someone had written a text file.
+
+Why? crontub let's your programmers specify how and where a script
+should run under cron.
+
+In addition, crontub let's you specify a role checker so that you can
+have different crontabs run on different environments (by adjusting
+the role checker).
+
+The config file:
+
+  [cron]
+  pidfile = path
+  roletest = somecommand
+
+'pidfile' is a path to a pidfile, where the daemon records it's pid,
+by default the pidfile is in /tmp/crontub.pid
+
+'roletest' specifies that somecommand be run to establish whether the
+cron should be run here or not.
+
+the roletest command is executed with the %% template variables:
+
+  'role' set to the role being tested
+  'user' set to the user being tested
+
+for example, setting 'roletest' thusly:
+
+  roletest = /usr/local/bin/check_is_staging -u %(user)s %(role)s 
+
+with a role of "staging" and a user of "woome" would cause the
+following command to be executed:
+
+  /usr/local/bin/check_is_staging -u woome staging
+
+"""
+
+import time
+import os
+import sys
+import string
+import logging
+
+logging.basicConfig()
+logger = logging.getLogger("cron")
+logger.setLevel(logging.INFO)
+
+import re
+from os.path import join as joinpath
+from os.path import basename
+from os.path import exists as pathexists
+
+# A regex to test crontab lines in scripts.
+CRON_RE = re.compile("^# CRON RUN (?P<role>[^ ]+)(?P<user>( )+[^ ]+)(?P<spec>( [^ ]+){5})(?P<args>( )+.*)*")
+
+# This finds the magic number... 
+# .. this makes cronmaker not usable for anything that doesn't use # as a comment.
+MAGIC_RE = re.compile("^#!(.*)$")
+
+
+import commands
+
+def match(value, expr):
+    """Match the cron expression against the current time.
+    
+    This is based on Emilio Schapira's original. Although extended it
+    is not a real implementation of a cron language; principally it
+    does not allow combination of the various forms. so you cannot
+    say:
+
+       */2, 46, 47, 48
+
+    for example.
+
+    >>> match(14, "*/5") 
+    False
+    >>> match(15, "*/5")
+    True
+    >>> match(7, "1-8")
+    True
+    >>> match(7, "7-8")
+    True
+    >>> match(7, "10-15")
+    False
+    >>> match(1, "*")
+    True
+    >>> match(59, "*")
+    True
+    >>> match(43, "15,20,40,43,57")
+    True
+    >>> match(43, "15,20,40,45,57")
+    False
+    """
+    if expr == '*':
+        return True
+
+    if re.match("([0-9]+,)+", expr):
+        for v in string.split(expr,','):
+            if int(v) == value:
+                return True
+
+    m = re.match("\\*/([0-9]+)", expr)
+    if m and (value % int(m.group(1)) == 0):
+        return True
+
+    m = re.match("([0-9]+)-([0-9]+)", expr)
+    if m and (value in range(*[int(x) for x in m.groups()])):
+        return True
+    return False
+
+
+import ConfigParser
+from pyproxyfs import Filesystem
+OSFILESYSTEM=Filesystem()
+
+class cron(object):
+    # cronspec markers
+    minute = 4
+    hour = 3
+    day = 2
+    month = 1
+    weekday = 6
+
+    def __init__(self, config, once=False, filesystem=OSFILESYSTEM):
+        """make a cron object
+
+        Parameters:
+        'config' is the configuration to use
+        'once' is whether to run through just once, great for testing
+        'filesystem' is used to abstract the filesystem, mainly for internal tests
+        """
+
+        self.fs = filesystem
+        self.config = config
+        self.once = once
+
+    def check_role(self, role, user):
+        """Check whether the role/user is compatible with the test configured here.
+        See config file details in __doc__
+        """
+        try:
+            status = commands.getstatus(self.config.cron.roletest % {
+                    "role": role,
+                    "user": user
+                    })
+            return status == 0
+        except (ConfigParser.NoOptionError, AttributeError):
+            return True
+
+    def crontab(self):
+        """Yields crontab specs for files that have a CRON RUN declaration.
+        """
+        for filename in self.fs.glob(self.config.cron.source_pattern):
+             with self.fs.open(filename) as f:
+                data = f.read()
+                lines = data.split("\n")
+                magic_action = MAGIC_RE.match(lines[0])
+                if not magic_action:
+                    continue
+                cron_lines = [line for line in lines if CRON_RE.search(line)]
+                for line in cron_lines:
+                    m = CRON_RE.search(line)
+                    role = m.group("role").strip()
+                    user = m.group("user").strip()
+
+                    if self.check_role(role, user):
+                        spec = m.group("spec").strip()
+                        command_args = m.group("args")
+                        # return the cron line
+                        cronspec = "%-12s %s %s %s 2>&1 | logger -p user.info -t %s" % (
+                            spec.strip(),
+                            magic_action.group(1),
+                            joinpath(os.getcwd(),filename),
+                            command_args.strip() if command_args else "",
+                            basename(filename),
+                            )
+                        yield cronspec, filename
+        return
+
+    def execute(self, command):
+        """Execute the specified command.
+        """
+        try:
+            status, output = commands.getstatusoutput(command)
+            # TODO: What to do with the output?
+
+            # I would like to mail it, as for cron, or syslog it
+
+            # I would also like a special feature that 'walls' output
+            # from certain commands, maybe ones that match a regex in
+            # the config file
+        except:
+            logger.warning('command failed to start: %s' % command)
+
+    def run(self):
+        # Loop forever
+        while True:
+            # Build a tuple with the current time
+            run_time = time.localtime()
+
+            # Read the crontab specifications
+            for line,filename in self.crontab():
+                try:
+                    tokens = string.split(line)
+
+                    # See if the cron entry matches the current time
+                    timeMatch = match(run_time[cron.minute],tokens[0]) \
+                        and match(run_time[cron.hour],tokens[1]) \
+                        and match(run_time[cron.day],tokens[2]) \
+                        and match(run_time[cron.month],tokens[3]) 
+
+                    weekdayval = run_time[cron.weekday]+1
+                    matchWeekday = match(weekdayval,tokens[4]) \
+                        or (weekdayval == 7 and match(0,tokens[4]))
+
+                    if timeMatch and matchWeekday:
+                        logger.debug("%s from %s DID MATCH %s" % (
+                                " ".join(tokens[0:4]),
+                                basename(filename),
+                                "%d:%d" % (
+                                    run_time[cron.hour], 
+                                    run_time[cron.minute]
+                                    )
+                                ))
+                        self.execute(string.join(tokens[5:]))
+                    else:
+                        logger.debug("%s from %s did not match %s" % (
+                                " ".join(tokens[0:4]),
+                                basename(filename),
+                                "%d:%d" % (
+                                    run_time[cron.hour], 
+                                    run_time[cron.minute]
+                                    )
+                                ))
+
+                except Exception, e:
+                    logger.error('%s parsing %s of %s' % (e, line, filename))
+
+            if self.once:
+                return
+            else:
+                # Sleep till the next loop
+                to_sleep = 60 - run_time.tm_sec
+                time.sleep(to_sleep)    
+
+import daemon
+import signal
+
+def lifecycle_cleanup():
+    sys.exit(0)
+
+def lifecycle_stop(conf):
+    with open(conf.get("pidfile", "/tmp/crontub.pid")) as pidfile:
+        pid = pidfile.read()
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except Exception, e:
+            print >>sys.stderr, "couldn't stop %s" % pid
+
+from StringIO import StringIO
+
+class AttrConfig(ConfigParser.RawConfigParser):
+    """A config class that allows attribute access"""
+    def __getattr__(self, key):
+        conf_self=self
+        class LazyResolver(object):
+            def __getattr__(self, itemkey):
+                return conf_self.get(key, itemkey)
+        return LazyResolver()
+
+def configread(config=None):
+    r"""Read the config file.
+
+    >>> configread("[cron]\npidfile = /var/run/crontub_pidfile\ndaemon = True\n").cron.pidfile
+    '/var/run/crontub_pidfile'
+
+    """
+    conf = AttrConfig()
+    if config:
+        conf.readfp(StringIO(config))
+    else:
+        conffile = os.environ.get(
+            "CRONTUBCONF", 
+            joinpath(os.environ["HOME"], ".crontub.conf")
+            )
+        if pathexists(conffile):
+            with open(conffile) as conffd:
+                conf.readfp(conffd)
+    
+    return conf
+
+
+def testcron():
+    """Suite of simple tests for crontub
+
+    It's difficult to assert a lot about cron execution but we can
+    assert that the correct cron is run.
+
+    >>> testcron().run()
+    check testrole has woome
+    /usr/bin/python /home/woome/app_mdb/woome/scripts/cron/auto_interbot.py 2>&1 | logger -p user.info -t auto_interbot.py
+    """
+    from pyproxyfs import TestFS
+    class testcrontub(cron):
+        def execute(self, command):
+            print command
+
+        def check_role(self, role, user):
+            print "check %s has %s" % (role, user)
+            return True
+
+    conf = configread(config="""[cron]
+source_pattern = /home/woome/*/woome/scripts/cron/*
+""")
+
+    cronfile = """#!/usr/bin/python 
+# CRON RUN testrole woome * * * * *
+
+if __name__ == "__main__":
+   print "hello world!!!"
+# End
+"""
+    c = testcrontub(
+        conf,
+        once=True, 
+        filesystem = TestFS({
+                "/home/woome/app_mdb/woome/scripts/cron/auto_interbot.py": cronfile,
+                "/home/woome/app_mdb/woome/scripts/cron/auto_intermsg.py": "",
+                "/home/woome/app/woome/scripts/cron/auto_interbot.py": "",
+                })
+        )
+    return c
+    
+def main():
+    # TODO: we need a proper command parser here
+    # the cmdln package is a good one.
+    conf = configread()
+    cmd = "help" if len(sys.argv) < 2 else sys.argv[1]
+    
+    if cmd == "help":
+        print __doc__
+        sys.exit(0)
+
+    if cmd == "run":
+        c = cron(conf, once=True)
+        c.run()
+
+    if cmd == "dryrun":
+        class dryruncron(cron):
+            def execute(self, command):
+                print ">>>" + command
+
+        c = dryruncron(conf, once=True)
+        c.run()
+        
+    if cmd == "start":
+        with daemon.DaemonContext() as dctx:
+            # Write the pid
+            with open(conf.get(
+                    "pidfile", 
+                    "/tmp/crontub.pid"
+                    ), "w") as pidfile:
+                pidfile.write("%s\n" % os.getpid())
+
+            # Set the signal map
+            dctx.signal_map = {
+                signal.SIGTERM: lifecycle_cleanup,
+                }
+            c = cron(conf)
+            c.run()
+
+    if cmd == "stop":
+        lifecycle_stop(conf)
+
+    if cmd == "test":
+        import doctest
+        doctest.testmod()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+
+# End
